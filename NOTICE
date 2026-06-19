@@ -1,0 +1,33 @@
+archon-bmad
+===========
+
+This project ports the implementation-automation pipeline of the BMAD Story
+Automator onto the Archon workflow engine.
+
+Derived from:
+
+  bmad-automator (bmad-story-automator)
+  https://github.com/bmad-code-org/bmad-automator
+  Copyright (c) 2026 BMAD — MIT License
+
+The adversarial code-review instructions inlined in
+`workflows/bmad-implement.yaml` (the `review` phase) are a paraphrased
+derivative of the bundled `bmad-story-automator-review` skill from that
+project. The per-story pipeline ordering (create -> dev -> auto -> review ->
+commit, with per-epic retrospectives) and the "sprint-status.yaml is the
+single source of truth" / "0 CRITICAL issues" completion gate are likewise
+modeled on that project.
+
+Designed for use with:
+
+  BMAD-METHOD
+  https://github.com/bmad-code-org/BMAD-METHOD
+  MIT License
+
+Built for:
+
+  Archon
+  https://archon.diy
+
+All upstream projects are MIT-licensed. This repository is also MIT-licensed
+(see LICENSE).

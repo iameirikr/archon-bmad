@@ -1,0 +1,4 @@
+.DS_Store
+*.log
+.archon/state/
+node_modules/

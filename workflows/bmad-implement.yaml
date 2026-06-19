@@ -1,0 +1,274 @@
+name: bmad-implement
+description: |
+  Use when: BMAD planning is done (sprint-status.yaml exists) and you want to automate the
+  implementation loop for one or more stories/epics — the same cycle the upstream
+  bmad-story-automator runs, but as a native Archon workflow (no tmux, no Python).
+  Triggers: "bmad implement", "automate bmad stories", "run the bmad build cycle",
+            "implement epic", "bmad story automator", "build the stories".
+  Does: A state-machine loop that, per story, plays one role per iteration —
+        create-story -> dev-story -> (optional qa e2e test-gen) -> adversarial review (<=5 retries)
+        -> commit — then fires a per-epic retrospective when every story in an epic is done.
+        sprint-status.yaml is the single source of truth; the loop verifies against it,
+        never trusting a session that merely "looks done."
+  NOT for: Planning/spec work (use BMAD's planning agents first), bug fixes, PR reviews.
+
+  Port of github.com/bmad-code-org/bmad-automator (MIT) onto the Archon workflow engine.
+  Requires a BMAD-METHOD project with the bmad-create-story, bmad-dev-story, and
+  bmad-retrospective skills installed (optionally bmad-qa-generate-e2e-tests).
+
+provider: claude
+model: medium
+
+# Isolation is left to the caller (Archon default = worktree for task/issue/pr).
+# Running inside a worktree keeps BMAD's mutations to sprint-status.yaml, story files,
+# and source isolated on a branch until you review and merge. Pass --no-worktree to the
+# CLI to run in the live checkout instead.
+
+nodes:
+  # ─── Phase 0: Resolve the BMAD project + initialize run state ─────────
+  - id: init
+    bash: |
+      set -euo pipefail
+      ART="$ARTIFACTS_DIR"
+      ROOT="$(pwd)"
+
+      CONFIG="$ROOT/_bmad/bmm/config.yaml"
+      if [ ! -f "$CONFIG" ]; then
+        echo "ERROR: BMAD config not found at $CONFIG." >&2
+        echo "This workflow must run from the root of a BMAD-METHOD project. Run 'bmad-method install' / planning first." >&2
+        exit 1
+      fi
+
+      # output_folder from config (BMAD convention defaults to _bmad-output)
+      OUTPUT_FOLDER="$(grep -E '^[[:space:]]*output_folder:' "$CONFIG" | head -1 | sed -E 's/^[[:space:]]*output_folder:[[:space:]]*//; s/["'"'"']//g; s/[[:space:]]*$//')"
+      [ -z "$OUTPUT_FOLDER" ] && OUTPUT_FOLDER="_bmad-output"
+      case "$OUTPUT_FOLDER" in
+        /*) : ;;
+        *) OUTPUT_FOLDER="$ROOT/$OUTPUT_FOLDER" ;;
+      esac
+
+      IMPL="$OUTPUT_FOLDER/implementation-artifacts"
+      SPRINT="$IMPL/sprint-status.yaml"
+      if [ ! -f "$SPRINT" ]; then
+        echo "ERROR: sprint-status.yaml not found at $SPRINT." >&2
+        echo "Run BMAD sprint planning before automating implementation." >&2
+        exit 1
+      fi
+
+      # Detect the optional QA e2e test-generation skill across supported skill roots.
+      SKIP_AUTOMATE=true
+      for sr in .claude/skills .agents/skills .codex/skills; do
+        if [ -f "$ROOT/$sr/bmad-qa-generate-e2e-tests/SKILL.md" ]; then
+          SKIP_AUTOMATE=false
+        fi
+      done
+
+      cat > "$ART/bmad-env.json" <<EOF
+      {
+        "root": "$ROOT",
+        "outputFolder": "$OUTPUT_FOLDER",
+        "implementationArtifacts": "$IMPL",
+        "sprintStatus": "$SPRINT",
+        "skipAutomate": $SKIP_AUTOMATE
+      }
+      EOF
+
+      cat > "$ART/state.json" <<EOF
+      {
+        "phase": "select",
+        "currentStory": null,
+        "currentEpic": null,
+        "reviewRetry": 0,
+        "maxReviewRetries": 5,
+        "createRetry": 0,
+        "maxCreateRetries": 2,
+        "skipAutomate": $SKIP_AUTOMATE,
+        "completedStories": [],
+        "completedEpics": [],
+        "status": "running",
+        "reason": ""
+      }
+      EOF
+
+      echo "BMAD env resolved."
+      echo "  sprint-status:  $SPRINT"
+      echo "  artifacts dir:  $IMPL"
+      echo "  skipAutomate:   $SKIP_AUTOMATE"
+    timeout: 30000
+
+  # ─── Phase 1: The implementation loop ────────────────────────────────
+  #
+  # One role per iteration, driven by $ARTIFACTS_DIR/state.json. fresh_context
+  # gives each role a clean session (mirrors the automator's isolated tmux
+  # sessions). sprint-status.yaml is re-read every iteration as the source of
+  # truth — a phase is never "done" just because the session ended.
+  #
+  - id: build-loop
+    depends_on: [init]
+    model: large
+    idle_timeout: 1800000
+    loop:
+      until: BMAD_RUN_COMPLETE
+      max_iterations: 150
+      fresh_context: true
+      until_bash: |
+        grep -qE '"status"[[:space:]]*:[[:space:]]*"(complete|failed)"' "$ARTIFACTS_DIR/state.json"
+      prompt: |
+        # BMAD Implementation Orchestrator — Build Loop
+
+        You automate the BMAD implementation loop for a selected set of stories, playing
+        exactly ONE role per iteration. You COORDINATE and invoke BMAD skills; you VERIFY
+        progress against the real `sprint-status.yaml` — never trust a phase that merely
+        "looks done." Do only the current phase, update `state.json`, then end your turn.
+
+        ## Stories the user asked to implement
+        $ARGUMENTS
+
+        (If the selection above is empty, target EVERY story in sprint-status that is not yet `done`.)
+
+        ## FIRST — load your state (every iteration)
+        1. Read `$ARTIFACTS_DIR/bmad-env.json` → `{ root, outputFolder, implementationArtifacts, sprintStatus, skipAutomate }`.
+        2. Read `$ARTIFACTS_DIR/state.json` → `{ phase, currentStory, currentEpic, reviewRetry, maxReviewRetries, createRetry, maxCreateRetries, status, ... }`.
+        3. Read the sprint-status file at `sprintStatus`. Its `development_status` map is the
+           SOURCE OF TRUTH for which stories are `done` / `in-progress` / `backlog`.
+
+        Then act on `phase` using the matching section below. The BMAD skills live under one of
+        the project skill roots (`.claude/skills`, `.agents/skills`, `.codex/skills`) and are
+        auto-discovered. Invoke them by name, always in **#YOLO autonomous mode** — never wait
+        for user input, never present a menu and stop. When a BMAD skill asks a question, make a
+        reasonable autonomous decision from sprint-status, the story files, the PRD, and the
+        architecture docs, and continue.
+
+        Always use ABSOLUTE paths. Do not `cd` away from `root` for verification steps.
+
+        ---
+
+        ## phase = "select"  — pick the next unit of work
+        - Resolve the user's selection into target stories/epics. "all"/empty = all not-`done` stories.
+        - Scan `development_status` in sprint order for the FIRST target story whose status is NOT `done`.
+        - If a target story is found:
+          - Set `currentStory` = its story key (e.g. `"2-3-user-auth"`), `currentEpic` = its epic number, `reviewRetry` = 0, `createRetry` = 0.
+          - If a story file matching that key already exists in `implementationArtifacts`, set `phase = "dev"`; otherwise `phase = "create"`.
+        - Else if a fully-`done` target epic has NOT yet had a retrospective (not in `completedEpics`):
+          - Set `currentEpic` = that epic, `phase = "retro"`.
+        - Else (everything selected is done and all completed epics have retros):
+          - Set `status = "complete"`, `phase = "done"`.
+        Update `state.json`. End turn.
+
+        ## phase = "create"  → bmad-create-story
+        Use the **bmad-create-story** skill to create the story file for story `{currentStory}`.
+        #YOLO — do NOT wait for user input. Write the story file under `implementationArtifacts`.
+        Then VERIFY: does a story file for `{currentStory}` now exist there?
+        - Yes → set `phase = "dev"`.
+        - No  → increment `createRetry`. If `createRetry < maxCreateRetries`, keep `phase = "create"`;
+                else set `status = "failed"`, `phase = "done"`, `reason = "create-story failed for {currentStory}"`.
+        Update `state.json`. End turn.
+
+        ## phase = "dev"  → bmad-dev-story
+        Use the **bmad-dev-story** skill to implement story `{currentStory}`.
+        Implement ALL tasks marked `[ ]`. Run the tests. Update the task checkboxes and the
+        story's Dev Agent Record / File List. Let the skill update sprint-status. #YOLO — autonomous.
+        Then set `phase = "auto"` if `skipAutomate` is false, otherwise `phase = "review"`.
+        Update `state.json`. End turn.
+
+        ## phase = "auto"  → bmad-qa-generate-e2e-tests (optional)
+        Use the **bmad-qa-generate-e2e-tests** skill for story `{currentStory}`.
+        Auto-apply all discovered gaps in tests. #YOLO. (If `skipAutomate` is true you should not
+        be here — just set `phase = "review"`.)
+        Then set `phase = "review"`. Update `state.json`. End turn.
+
+        ## phase = "review"  → adversarial code review (INLINE — do NOT call an external skill)
+        🔥 You are an ADVERSARIAL code reviewer. Your purpose: validate the story file's CLAIMS
+        against the ACTUAL implementation and git reality. Find what is wrong or missing. Do not
+        write lazy "looks good" reviews. Exclude `_bmad/`, `_bmad-output/`, and IDE/CLI config
+        dirs (`.cursor/`, `.windsurf/`, etc.) from review — only review application source code.
+
+        1. Read the COMPLETE story file for `{currentStory}` (in `implementationArtifacts`).
+           Parse: Story, Acceptance Criteria, Tasks/Subtasks (with `[x]`/`[ ]`), Dev Agent Record → File List.
+        2. Discover real changes via git (absolute paths, no `cd`):
+           `git -C {root} status --porcelain`, `git -C {root} diff --name-only`, `git -C {root} diff --cached --name-only`.
+           Cross-check the story's File List against git reality:
+             - file changed in git but absent from File List → MEDIUM
+             - file claimed in File List but no git change → HIGH (false claim)
+        3. For EACH Acceptance Criterion: search the implementation for evidence.
+           IMPLEMENTED / PARTIAL / MISSING. PARTIAL or MISSING → HIGH.
+        4. For EACH task marked `[x]`: verify it was actually done. Marked done but NOT done → CRITICAL.
+        5. Code quality pass on the changed files: security (injection, missing validation, auth),
+           error handling, performance (N+1, hot loops), and TEST QUALITY (real assertions vs placeholders).
+        6. AUTO-FIX all CRITICAL and HIGH findings directly in the code. Add/adjust tests. Re-run the
+           tests to confirm green. Update the story's File List and Dev Agent Record with what you fixed.
+
+        Outcome (CRITICAL issues are the only gate — HIGH/MEDIUM/LOW are tracked, not blocking):
+        - **0 CRITICAL remain after fixes** → set the story file `Status: done`, sync
+          `development_status[{currentStory}] = done` in sprint-status.yaml (preserve all comments
+          and structure), set `phase = "commit"`.
+        - **1+ CRITICAL remain** → sync `development_status[{currentStory}] = in-progress`,
+          increment `reviewRetry`.
+            - `reviewRetry < maxReviewRetries` → keep `phase = "review"` (re-attack + fix next iteration).
+            - `reviewRetry >= maxReviewRetries` → `status = "failed"`, `phase = "done"`,
+              `reason = "story {currentStory} failed review after {maxReviewRetries} cycles"`.
+        Update `state.json`. End turn.
+
+        ## phase = "commit"
+        Commit the verified work (absolute path, no `cd`):
+          `git -C {root} add -A && git -C {root} commit -m "feat({currentStory}): implement via bmad-implement" || true`
+        Then advance:
+        - Append `{currentStory}` to `completedStories`. Set `currentStory = null`, `reviewRetry = 0`.
+        - Re-read sprint-status: are ALL stories in `{currentEpic}` now `done`?
+            - Yes AND `{currentEpic}` not in `completedEpics` → set `phase = "retro"` (keep `currentEpic`).
+            - Otherwise → set `phase = "select"`.
+        Update `state.json`. End turn.
+
+        ## phase = "retro"  → bmad-retrospective (per epic, NON-BLOCKING)
+        Use the **bmad-retrospective** skill for epic `{currentEpic}`, in #YOLO mode. Assume NO user
+        input. For every prompt that expects input, decide autonomously from sprint-status, the
+        story files and their dev notes, the previous retrospective (if any), and the architecture/PRD.
+        Auto-confirm the epic number from sprint-status; synthesize observations from the story analysis;
+        make data-driven decisions; pick the most appropriate menu option; skip all "WAIT for user" steps.
+
+        After the retrospective creates its documents, verify implementation-learning doc updates:
+          1. List docs that may need updates (architecture decisions, API docs, READMEs, config docs).
+          2. For each, read the current content and compare against the ACTUAL implementation code.
+          3. Update only docs with verified discrepancies; discard proposed updates where code matches docs.
+
+        This phase is NON-BLOCKING: if the retrospective errors for any reason, log it and continue —
+        never fail the run for a retro. When done (or on error):
+        - Append `{currentEpic}` to `completedEpics`. Set `currentEpic = null`, `phase = "select"`.
+        Update `state.json`. End turn.
+
+        ---
+
+        ## COMPLETION
+        After updating `state.json`, check `status`:
+        - `status == "complete"` → output exactly: <promise>BMAD_RUN_COMPLETE</promise>
+        - `status == "failed"`   → output exactly: <promise>BMAD_RUN_COMPLETE</promise>
+        - otherwise → do NOT output any completion signal. Just end your turn; the loop continues.
+
+  # ─── Phase 2: Report ─────────────────────────────────────────────────
+  - id: report
+    depends_on: [build-loop]
+    trigger_rule: all_done
+    context: fresh
+    model: small
+    prompt: |
+      Generate a concise run report for this BMAD implementation run.
+
+      Read:
+      1. `$ARTIFACTS_DIR/state.json` — final status (`complete`/`failed`), completedStories, completedEpics, reason.
+      2. `$ARTIFACTS_DIR/bmad-env.json` — the sprint-status path.
+      3. The sprint-status file (from bmad-env.json) — final per-story status.
+      4. `git -C <root> log --oneline -30` — the commits this run produced.
+
+      Report:
+      ### Outcome
+      - Final status, and (if failed) the escalation reason verbatim.
+      ### Stories
+      - Table of each targeted story: final sprint-status, and whether it was committed this run.
+      ### Epics & Retrospectives
+      - Which epics completed and which had a retrospective run.
+      ### Next steps
+      - If isolated in a worktree: how to review and merge the branch.
+      - Any stories left `in-progress` or `failed` that need a human.
+
+      Write the report to `$ARTIFACTS_DIR/report.md` AND output it directly so the user sees it.
+    allowed_tools: [Read, Bash, Glob, Grep, Write]
