@@ -6,7 +6,7 @@ description: |
   Triggers: "bmad implement", "automate bmad stories", "run the bmad build cycle",
             "implement epic", "bmad story automator", "build the stories".
   Does: A state-machine loop that, per story, plays one role per iteration —
-        create-story -> dev-story -> (optional qa e2e test-gen) -> adversarial review (<=5 retries)
+        create-story -> dev-story -> (optional qa e2e test-gen) -> adversarial review (<=8 retries)
         -> commit — then fires a per-epic retrospective when every story in an epic is done.
         sprint-status.yaml is the single source of truth; the loop verifies against it,
         never trusting a session that merely "looks done."
@@ -132,7 +132,7 @@ nodes:
         "currentStory": null,
         "currentEpic": null,
         "reviewRetry": 0,
-        "maxReviewRetries": 5,
+        "maxReviewRetries": 8,
         "createRetry": 0,
         "maxCreateRetries": 2,
         "skipAutomate": $SKIP_AUTOMATE,
@@ -257,14 +257,15 @@ nodes:
         4. For EACH task marked `[x]`: verify it was actually done. Marked done but NOT done → CRITICAL.
         5. Code quality pass on the changed files: security (injection, missing validation, auth),
            error handling, performance (N+1, hot loops), and TEST QUALITY (real assertions vs placeholders).
-        6. AUTO-FIX all CRITICAL and HIGH findings directly in the code. Add/adjust tests. Re-run the
-           tests to confirm green. Update the story's File List and Dev Agent Record with what you fixed.
+        6. AUTO-FIX all CRITICAL, HIGH, and MEDIUM findings directly in the code. Add/adjust tests.
+           Re-run the tests to confirm green. Update the story's File List and Dev Agent Record with
+           what you fixed.
 
-        Outcome (CRITICAL issues are the only gate — HIGH/MEDIUM/LOW are tracked, not blocking):
-        - **0 CRITICAL remain after fixes** → set the story file `Status: done`, sync
+        Outcome (CRITICAL and HIGH issues gate — MEDIUM/LOW are fixed where practical but never blocking):
+        - **0 CRITICAL and 0 HIGH remain after fixes** → set the story file `Status: done`, sync
           `development_status[{currentStory}] = done` in sprint-status.yaml (preserve all comments
           and structure), set `phase = "commit"`.
-        - **1+ CRITICAL remain** → sync `development_status[{currentStory}] = in-progress`,
+        - **1+ CRITICAL or 1+ HIGH remain** → sync `development_status[{currentStory}] = in-progress`,
           increment `reviewRetry`.
             - `reviewRetry < maxReviewRetries` → keep `phase = "review"` (re-attack + fix next iteration).
             - `reviewRetry >= maxReviewRetries` → `status = "failed"`, `phase = "done"`,
