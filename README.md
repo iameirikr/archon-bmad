@@ -1,4 +1,4 @@
-# archon-bmad
+# Archon BMAD
 
 **A collection of [BMAD-METHOD](https://github.com/bmad-code-org/BMAD-METHOD) workflows for the
 [Archon](https://archon.diy) workflow engine.**
