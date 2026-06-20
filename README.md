@@ -5,8 +5,8 @@
 
 This repository is a home for native Archon workflows that automate parts of the BMAD method. Each
 workflow is a self-contained `*.yaml` file in [`workflows/`](./workflows) that runs locally, in chat,
-on the web UI, or in an isolated git worktree — no tmux, no Python helper, no separate orchestrator
-process. Install them all at once and run whichever one you need.
+or on the web UI — no tmux, no Python helper, no separate orchestrator process. Install them all at
+once and run whichever one you need.
 
 The collection grows over time. The first workflow,
 [`archon-bmad-story-automator`](#archon-bmad-story-automator), automates the BMAD *implementation*
@@ -100,8 +100,9 @@ any project BMAD targets (the workflow itself is project-agnostic).
 
 #### Usage
 
-Run from the **root of your BMAD project** (no isolation flags needed — see
-[Isolation](#isolation) for why):
+Run from the **root of your BMAD project** — it works directly in your live checkout. By default the
+per-story commits land on your current branch; add `--isolate` to land them on a fresh branch instead
+(see [Isolation](#isolation)):
 
 ```bash
 # Implement a whole epic
@@ -124,24 +125,37 @@ natural phrasing ("epic 2", "the auth stories", "everything left") works.
 
 #### Isolation
 
-This workflow **always runs in your live checkout** — it declares `worktree.enabled: false`, so
-Archon never creates a worktree and you never need a `--no-worktree` flag (passing `--branch` or
-`--from` is rejected with a clear error).
+By default, Archon runs each workflow in an isolated git worktree — a fresh checkout of the repo's
+*tracked* files. For BMAD that isolation is exactly wrong: BMAD gitignores everything this workflow
+depends on — `_bmad/` (its config and the scripts the skills execute), `.claude/` (the BMAD skills
+themselves), and usually the output folder holding `sprint-status.yaml` and the story files. In a
+worktree none of that is present, so both the `init` guard and the BMAD skills fail. The live
+checkout is the only place they all exist together.
 
-Why it has to: Archon's default worktree is a fresh checkout of *tracked* files only, but BMAD
-gitignores everything this workflow depends on — `_bmad/` (its config and the Python scripts the
-skills execute), `.claude/` (the BMAD skills themselves), and usually the output folder holding
-`sprint-status.yaml` and the story files. In a worktree all of that is absent, so both the `init`
-guard and the BMAD skills fail. The live checkout is the only place they all exist together.
+That's why the workflow declares `worktree.enabled: false` in its YAML — it pins every run to your
+live checkout. There's no flag to pass and nothing to remember; it's baked into the workflow.
 
-The per-story commits land on **your current branch**. To get isolation, make your own throwaway
-branch before running and review it afterward:
+Isolation is still available, just at the **branch** level instead of the worktree level. By default
+the per-story commits land on **your current branch**. Add **`--isolate`** to the run argument and
+the workflow creates a fresh branch `bmad/<slug-of-your-selection>` up front,
+lands every commit there, and leaves it for you to review (it never auto-merges or deletes):
 
 ```bash
-git checkout -b bmad/epic-2
-archon workflow run archon-bmad-story-automator "epic 2"
-# review the commits, then merge — or `git branch -D bmad/epic-2` to discard
+archon workflow run archon-bmad-story-automator "epic 2 --isolate"
+# → creates & switches to branch `bmad/epic-2`, commits the run there
 ```
+
+Because a branch (unlike a worktree) shares the same working directory, the gitignored BMAD inputs
+are all still present — which is why this works where Archon's `--branch` worktree can't. The final
+report prints the exact commands to review and merge or discard. To integrate when you're happy:
+
+```bash
+git log --oneline <base>..bmad/epic-2          # see what landed
+git checkout <base> && git merge --no-ff bmad/epic-2   # merge, or:
+git branch -D bmad/epic-2                       # discard everything
+```
+
+(You can still manage branches manually instead — just omit `--isolate` and `git checkout -b` yourself.)
 
 #### Configuration knobs
 

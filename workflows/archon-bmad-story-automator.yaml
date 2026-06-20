@@ -27,10 +27,11 @@ model: sonnet  # real Claude alias; tier names (small/medium/large) require conf
 # worktree.enabled:false pins the run to the live checkout, so no --no-worktree flag is
 # needed (and --branch/--from are rejected with a clear error).
 #
-# For isolation, create your own throwaway branch first, then run:
-#   git checkout -b bmad/epic-2
-#   archon workflow run archon-bmad-story-automator "epic 2"
-# Review the per-story commits, then merge or `git branch -D` to discard.
+# For isolation, pass `--isolate` in the run argument; the `init` node below creates a fresh
+# `bmad/<slug>` branch up front so every per-story commit lands there:
+#   archon workflow run archon-bmad-story-automator "epic 2 --isolate"
+# Review the per-story commits on that branch, then merge or `git branch -D` to discard. (You can
+# still branch manually instead — omit `--isolate` and `git checkout -b` yourself.)
 worktree:
   enabled: false       # always run in the live checkout; BMAD's inputs are gitignored
 mutates_checkout: true # writes story files, sprint-status, and commits into the checkout
@@ -82,13 +83,46 @@ nodes:
         fi
       done
 
+      # ─── Optional branch isolation (opt-in: include `--isolate` in the run argument) ───
+      # A branch — unlike an Archon worktree — keeps the SAME working directory, so the gitignored
+      # BMAD inputs (_bmad/, .claude/, _bmad-output/) are all still present. We create it here, before
+      # the loop, so every per-story commit lands on it. At the end you review and merge (or discard)
+      # the branch yourself; the workflow never auto-merges or deletes it.
+      ISOLATE=false
+      WORK_BRANCH=""
+      BASE_BRANCH="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+      case "$ARGUMENTS" in
+        *--isolate*) ISOLATE=true ;;
+      esac
+      if [ "$ISOLATE" = true ]; then
+        # Branch name = bmad/<slug-of-selection> (the --isolate token stripped out).
+        SLUG="$(printf '%s' "$ARGUMENTS" | sed -E 's/--isolate//g' | tr '[:upper:]' '[:lower:]' \
+                | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40 | sed -E 's/-+$//')"
+        [ -z "$SLUG" ] && SLUG="stories"
+        WORK_BRANCH="bmad/$SLUG"
+        if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$WORK_BRANCH"; then
+          WORK_BRANCH="bmad/$SLUG-$(date +%Y%m%d-%H%M%S)"   # avoid collision with an existing branch
+        fi
+        if git -C "$ROOT" checkout -b "$WORK_BRANCH" >/dev/null 2>&1; then
+          echo "Isolation ON: created and switched to '$WORK_BRANCH' (from '$BASE_BRANCH')."
+        else
+          echo "WARNING: could not create branch '$WORK_BRANCH'; continuing on '$BASE_BRANCH'." >&2
+          ISOLATE=false; WORK_BRANCH=""
+        fi
+      else
+        echo "Isolation OFF: commits land on the current branch ('$BASE_BRANCH'). Pass --isolate to branch."
+      fi
+
       cat > "$ART/bmad-env.json" <<EOF
       {
         "root": "$ROOT",
         "outputFolder": "$OUTPUT_FOLDER",
         "implementationArtifacts": "$IMPL",
         "sprintStatus": "$SPRINT",
-        "skipAutomate": $SKIP_AUTOMATE
+        "skipAutomate": $SKIP_AUTOMATE,
+        "isolate": $ISOLATE,
+        "workBranch": "$WORK_BRANCH",
+        "baseBranch": "$BASE_BRANCH"
       }
       EOF
 
@@ -143,7 +177,9 @@ nodes:
         ## Stories the user asked to implement
         $ARGUMENTS
 
-        (If the selection above is empty, target EVERY story in sprint-status that is not yet `done`.)
+        (Ignore any `--isolate` token in the selection above — it only toggles branch isolation and is
+        already handled by `init`. If nothing meaningful remains, target EVERY story in sprint-status
+        that is not yet `done`.)
 
         ## FIRST — load your state (every iteration)
         1. Read `$ARTIFACTS_DIR/bmad-env.json` → `{ root, outputFolder, implementationArtifacts, sprintStatus, skipAutomate }`.
@@ -300,7 +336,7 @@ nodes:
 
       Read:
       1. `$ARTIFACTS_DIR/state.json` — final status (`complete`/`failed`), completedStories, completedEpics, reason.
-      2. `$ARTIFACTS_DIR/bmad-env.json` — the sprint-status path.
+      2. `$ARTIFACTS_DIR/bmad-env.json` — sprint-status path, and `isolate` / `workBranch` / `baseBranch`.
       3. The sprint-status file (from bmad-env.json) — final per-story status.
       4. `git -C <root> log --oneline -30` — the commits this run produced.
 
@@ -312,7 +348,12 @@ nodes:
       ### Epics & Retrospectives
       - Which epics completed and which had a retrospective run.
       ### Next steps
-      - If isolated in a worktree: how to review and merge the branch.
+      - If `isolate` is true: this run's commits are on branch `{workBranch}` (created from `{baseBranch}`).
+        The workflow did NOT merge or delete it. Give the exact commands to review and integrate:
+          `git -C <root> log --oneline {baseBranch}..{workBranch}`   (see what landed)
+          `git -C <root> checkout {baseBranch} && git -C <root> merge --no-ff {workBranch}`   (merge), or
+          `git -C <root> branch -D {workBranch}`   (discard everything).
+      - If `isolate` is false: commits landed on `{baseBranch}` directly — no branch step needed.
       - Any stories left `in-progress` or `failed` that need a human.
 
       Write the report to `$ARTIFACTS_DIR/report.md` AND output it directly so the user sees it.
