@@ -76,12 +76,53 @@ For each selected story it plays one role per loop iteration, verifying against 
 | `create` | `bmad-create-story`             | Write the next story file (YOLO, autonomous)                       |
 | `dev`    | `bmad-dev-story`                | Implement all `[ ]` tasks, run tests, tick checkboxes              |
 | `auto`   | `bmad-qa-generate-e2e-tests`    | Optional — test-gen; **auto-skipped** if the skill isn't installed |
-| `review` | _inlined adversarial reviewer_  | Attack impl vs story claims + git reality; auto-fix; **gate = 0 CRITICAL**; loops ≤ 5 |
+| `review` | _inlined adversarial reviewer_  | Attack impl vs story claims + git reality; auto-fix; **gate = 0 CRITICAL & 0 HIGH**; loops ≤ 8 |
 | `commit` | —                               | `git commit` only after review verifies                            |
 | `retro`  | `bmad-retrospective`            | Fires per epic when every story in it is `done`; YOLO; non-blocking |
 
 When everything in your selection is `done` and each completed epic has had its retrospective, the
 run finishes and emits a report.
+
+#### Review gating & automatic fixes
+
+The `review` phase is an **inlined adversarial reviewer**, not a rubber stamp. Each iteration it
+validates the story file's *claims* against the *actual* implementation and git reality — cross-checking
+the File List against `git status`/`git diff`, hunting for acceptance criteria that are missing or only
+partially implemented, verifying that every task marked `[x]` was genuinely done, and doing a code-quality
+pass (security, error handling, performance, real-vs-placeholder test assertions). Because it runs with
+`fresh_context: true`, every pass is a clean-slate re-attack rather than a reviewer talking itself into
+"looks good."
+
+Findings are bucketed into four severities, and the workflow treats them differently along **two
+independent axes** — what gets *fixed*, and what *blocks the commit*:
+
+| Severity   | Example                                                                       | Auto-fixed?            | Gates the commit? |
+| ---------- | ---------------------------------------------------------------------------- | ---------------------- | ----------------- |
+| `CRITICAL` | A task marked `[x]` that wasn't actually done; a File-List file with no git change (false claim) | Yes                    | **Yes**           |
+| `HIGH`     | An acceptance criterion missing or only partial; a security hole             | Yes                    | **Yes**           |
+| `MEDIUM`   | A changed file absent from the story's File List; weak error handling        | Yes, where practical   | No                |
+| `LOW`      | Style nits, minor cleanups                                                   | Tracked only           | No                |
+
+**Automatic fixes.** When the reviewer finds a `CRITICAL`, `HIGH`, or `MEDIUM` issue it edits the code
+directly, adds or adjusts tests, and re-runs the suite to confirm green — all *within the same iteration*,
+so fixing more issues doesn't cost extra loops. `LOW` findings are recorded in the review notes but left
+for a human. None of these fixes are committed during `review`; they sit uncommitted in the working tree
+so the whole story still lands as **one atomic commit** in the `commit` phase.
+
+**The gate.** A story is only allowed to flip to `done` when **0 CRITICAL and 0 HIGH** findings remain
+after the fix pass. If any CRITICAL or HIGH survives, the story is set back to `in-progress`, the retry
+counter increments, and the loop re-enters `review` for another adversarial pass — up to
+**`maxReviewRetries` (default 8)** times. Exhausting the retries marks the story `failed` with an
+escalation reason rather than shipping it. Gating on `HIGH` (not just `CRITICAL`) also closes a subtle
+gap: a fix applied to a HIGH finding gets re-verified by a fresh adversarial pass before commit, instead
+of being committed unchecked.
+
+**Why MEDIUM/LOW don't gate.** An adversarial reviewer with fresh context can almost always surface
+*some* subjective MEDIUM ("add more coverage", "consider refactoring"). Letting those block the loop
+risks never converging and failing perfectly good stories on taste. So MEDIUM is fixed opportunistically
+but never blocks, and LOW is left to human judgment. In practice CRITICAL and HIGH clear within a couple
+of cycles, so the 8-retry ceiling is comfortable headroom rather than an expected limit — tune it (and
+the other knobs) under [Configuration knobs](#configuration-knobs).
 
 #### Requirements
 
@@ -184,9 +225,10 @@ This is a faithful port of the *pipeline*, deliberately simplified for the Archo
   selection via config tiers; set the loop `model` (or tiers) once.
 - **Commit-only, like the upstream** — it does not open PRs. Add a final node if you want one.
 
-Everything else — the `create → dev → auto → review(≤5) → commit` per-story sequence, the
-"0 CRITICAL issues" completion gate, sprint-status as source of truth, and per-epic retrospectives
-fired inside the loop — matches the automator.
+Everything else — the `create → dev → auto → review(≤8) → commit` per-story sequence, the
+adversarial review gate (see [Review gating & automatic fixes](#review-gating--automatic-fixes)),
+sprint-status as source of truth, and per-epic retrospectives fired inside the loop — matches the
+automator.
 
 ---
 
